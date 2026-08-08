@@ -200,7 +200,7 @@
 const PX_PER_CM = 1;          // 1 cm = 1 px at zoom 1
 
 const state = {
-  room: { pts: [], locked:false, lockedSize:false, name:'Room' },
+  room: { pts: [], locked:false, lockedSize:false, name:'Room', wall:12 },
   objects: [],                 // {id,name,x,y,w,h,color,locked,lockedSize}
   gridCm: 10,
   snapGrid: true,
@@ -298,6 +298,19 @@ function distToSeg(p, a, b){
    difference — the job here is to pick one the user has not pinned.
    ====================================================================== */
 const EPS = 1e-6;
+const DEFAULT_WALL = 12;                       // cm, a typical internal partition
+const wallCm = () => Math.max(0, +state.room.wall || 0);
+
+/* The outline is the inside face, so the outer footprint is the outline grown
+   by the wall thickness. Rectilinear makes this exact: a corner's outer point
+   just takes the offset x of its vertical wall and the offset y of its
+   horizontal one. */
+function outerBounds(pts){
+  const bb = polyBounds(pts);
+  if (!bb) return null;
+  const t = wallCm();
+  return {x:bb.x-t, y:bb.y-t, w:bb.w+2*t, h:bb.h+2*t};
+}
 const wallEnds = (pts,i) => ({a:pts[i], b:pts[(i+1)%pts.length]});
 function wallAxis(pts,i){
   const {a,b} = wallEnds(pts,i);
@@ -496,17 +509,35 @@ function drawGrid(W,H){
 function drawRoom(){
   const pts = state.room.pts;
   const locked = state.room.locked;
-  ctx.beginPath();
-  pts.forEach((p,i) => i ? ctx.lineTo(sx(p.x),sy(p.y)) : ctx.moveTo(sx(p.x),sy(p.y)));
-  ctx.closePath();
+  const roomPath = () => {
+    ctx.beginPath();
+    pts.forEach((p,i) => i ? ctx.lineTo(sx(p.x),sy(p.y)) : ctx.moveTo(sx(p.x),sy(p.y)));
+    ctx.closePath();
+  };
+  roomPath();
   ctx.fillStyle = '#f7f9fc';
   ctx.fill();
+
+  /* The outline IS the inner face of the walls, so every length the user sees
+     is an internal one. Canvas can only centre a stroke, so stroke at double
+     width and clip away everything inside the room — what is left is a wall of
+     the right thickness sitting entirely outside the outline. */
+  const W = cv.width/dpr, H = cv.height/dpr;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0,0,W,H);
+  pts.forEach((p,i) => i ? ctx.lineTo(sx(p.x),sy(p.y)) : ctx.moveTo(sx(p.x),sy(p.y)));
+  ctx.closePath();
+  ctx.clip('evenodd');
+  roomPath();
   ctx.strokeStyle = locked ? '#c8892a' : '#39424e';
-  ctx.lineWidth = Math.max(3, 12*view.z);
-  ctx.lineJoin = 'round';
+  ctx.lineWidth = Math.max(4, 2*wallCm()*PX_PER_CM*view.z);
+  ctx.lineJoin = 'miter';
+  ctx.miterLimit = 8;
   if (locked) ctx.setLineDash([9,5]);
   ctx.stroke();
   ctx.setLineDash([]);
+  ctx.restore();
 
   // edge length labels
   ctx.font = '11px ui-monospace,Menlo,monospace';
@@ -523,7 +554,7 @@ function drawRoom(){
     let nx = -(sy(b.y)-sy(a.y)), ny = (sx(b.x)-sx(a.x));
     const nl = Math.hypot(nx,ny)||1; nx/=nl; ny/=nl;
     if ((mx-cx)*nx + (my-cy)*ny < 0){ nx=-nx; ny=-ny; }
-    const off = Math.max(3, 6*view.z) + 11;
+    const off = Math.max(3, wallCm()*PX_PER_CM*view.z) + 11;
     const pin = !!a.fix;
     const txt = (pin?'▮ ':'') + fmt(dist(a,b)) + ' cm';
     const isSel = state.sel && state.sel.kind==='edge' && state.sel.i===i;
@@ -794,7 +825,8 @@ function hitEdge(px,py){
   if (!hasRoom()) return -1;
   const pts = state.room.pts;
   const p = {x:wx(px), y:wy(py)};
-  const tol = Math.max(8/(PX_PER_CM*view.z), 7);
+  // the wall is drawn outwards from the outline, so reach across its thickness
+  const tol = Math.max(8/(PX_PER_CM*view.z), 7, wallCm());
   for (let i=0;i<pts.length;i++)
     if (distToSeg(p, pts[i], pts[(i+1)%pts.length]) <= tol) return i;
   return -1;
@@ -1098,7 +1130,7 @@ const hist = {stack:[], i:-1};
 // The grid size and the viewport are display settings, so they stay out of it.
 function modelJSON(){
   return JSON.stringify({
-    room:{name:state.room.name, pts:state.room.pts,
+    room:{name:state.room.name, pts:state.room.pts, wall:state.room.wall,
           locked:state.room.locked, lockedSize:state.room.lockedSize},
     objects:state.objects
   });
@@ -1127,7 +1159,7 @@ function restore(entry){
   const d = JSON.parse(entry.m);
   state.room = {name:d.room.name,
                 pts:d.room.pts.map(p=>({x:p.x, y:p.y, fix:!!p.fix})),
-                locked:d.room.locked, lockedSize:d.room.lockedSize};
+                wall:d.room.wall, locked:d.room.locked, lockedSize:d.room.lockedSize};
   state.objects = d.objects.map(o=>Object.assign({}, o));
   state.sel = validSel(entry.sel);
   if (renaming) endRename();
@@ -1403,6 +1435,11 @@ function syncPanel(){
        <div class="row"><label>X</label><input type="number" step="1" id="rX" value="${fmt(bb.x)}" ${r.locked?'disabled':''}><span class="unit">cm</span></div>
        <div class="row"><label>Y</label><input type="number" step="1" id="rY" value="${fmt(bb.y)}" ${r.locked?'disabled':''}><span class="unit">cm</span></div>
      </div>
+     <div style="height:11px"></div>
+     <div class="row"><label>Wall</label>
+       <input type="number" step="1" min="0" max="100" id="rWall" value="${fmt(wallCm())}" ${r.locked?'disabled':''}><span class="unit">cm</span></div>
+     <div class="note">Wall thickness is drawn outwards, so every length and the
+       floor area shown are internal &mdash; measured inside face to inside face.</div>
      <div style="height:12px"></div>
      <div class="toggle ${r.locked?'on':''}" id="tgRLock"><span>${lockIcon} Lock position &amp; shape</span>
        <input type="checkbox" ${r.locked?'checked':''} tabindex="-1" style="pointer-events:none"></div>
@@ -1416,10 +1453,16 @@ function syncPanel(){
     const nx=parseFloat($('rX').value), ny=parseFloat($('rY').value);
     const b2=polyBounds(r.pts);
     const dx=(isNaN(nx)?b2.x:nx)-b2.x, dy=(isNaN(ny)?b2.y:ny)-b2.y;
-    r.pts=r.pts.map(p=>({x:clean(p.x+dx), y:clean(p.y+dy)}));
+    r.pts=r.pts.map(p=>({x:clean(p.x+dx), y:clean(p.y+dy), fix:p.fix}));
     updStats(); draw();
   };
   ['rX','rY'].forEach(id=>{const el=$(id); if(el) el.addEventListener('change',move);});
+  const wEl=$('rWall');
+  if(wEl){
+    const setW=()=>{ const v=parseFloat(wEl.value);
+      if(!isNaN(v)){ r.wall=Math.max(0,Math.min(100,v)); updStats(); draw(); } };
+    wEl.addEventListener('input',setW); wEl.addEventListener('change',setW);
+  }
   $('tgRLock').addEventListener('click',()=>{ r.locked=!r.locked; syncPanel(); draw(); });
   $('tgRSize').addEventListener('click',()=>{
     if (r.locked){ showHint('Position lock already includes the shape — turn it off first.'); return; }
@@ -1488,14 +1531,16 @@ function delObject(id){
 function updStats(){
   if (!hasRoom()){ roomStats.innerHTML='<div class="empty" style="padding:8px 0">No room defined yet.</div>'; return; }
   const pts=state.room.pts;
-  const bb=polyBounds(pts);
+  const bb=polyBounds(pts), ob=outerBounds(pts);
   roomStats.innerHTML =
     `<div class="stat"><span>Name</span><b>${esc(state.room.name||'Room')}</b></div>
      <div class="stat"><span>Corners</span><b>${pts.length}</b></div>
      <div class="stat"><span>Walls</span><b>${pts.length}</b></div>
-     <div class="stat"><span>Perimeter</span><b>${fmt(polyPerimeter(pts))} cm</b></div>
+     <div class="stat"><span>Wall</span><b>${fmt(wallCm())} cm</b></div>
+     <div class="stat"><span>Internal perimeter</span><b>${fmt(polyPerimeter(pts))} cm</b></div>
      <div class="stat"><span>Floor area</span><b>${(polyArea(pts)/10000).toFixed(2)} m²</b></div>
-     <div class="stat"><span>Bounding box</span><b>${fmt(bb.w)} × ${fmt(bb.h)} cm</b></div>`;
+     <div class="stat"><span>Internal size</span><b>${fmt(bb.w)} × ${fmt(bb.h)} cm</b></div>
+     <div class="stat"><span>External size</span><b>${fmt(ob.w)} × ${fmt(ob.h)} cm</b></div>`;
 }
 
 function refreshList(){
@@ -1580,7 +1625,9 @@ document.getElementById('zOut').addEventListener('click',()=>zoomBy(0.8));
 document.getElementById('zFit').addEventListener('click',fit);
 
 function contentBounds(){
-  let pts = hasRoom()? state.room.pts.slice() : [];
+  let pts = [];
+  if (hasRoom()){ const ob=outerBounds(state.room.pts);   // include the wall band
+    pts.push({x:ob.x,y:ob.y},{x:ob.x+ob.w,y:ob.y+ob.h}); }
   state.objects.forEach(o=>{objCorners(o).forEach(c=>pts.push(c));});
   if(!pts.length) return null;
   return polyBounds(pts);
@@ -1600,7 +1647,8 @@ function fit(){
 /* ---------------- save / load / export ---------------- */
 document.getElementById('btnSave').addEventListener('click',()=>{
   const data={format:'roomplan',version:2,units:'cm',gridCm:state.gridCm,
-    room:{name:state.room.name,pts:state.room.pts,locked:state.room.locked,lockedSize:state.room.lockedSize},
+    room:{name:state.room.name,pts:state.room.pts,wall:state.room.wall,
+          locked:state.room.locked,lockedSize:state.room.lockedSize},
     objects:state.objects};
   dl(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),'room-'+stamp()+'.json');
   showHint('Plan saved.');
@@ -1617,7 +1665,8 @@ document.getElementById('fileIn').addEventListener('change',e=>{
       const raw=d.room.pts.map(p=>({x:+p.x,y:+p.y,fix:!!p.fix}));
       const sq=rectify(raw);
       state.room={name:d.room.name||'Room', pts:sq,
-                  locked:!!d.room.locked, lockedSize:!!d.room.lockedSize};
+                  locked:!!d.room.locked, lockedSize:!!d.room.lockedSize,
+                  wall:d.room.wall==null?DEFAULT_WALL:Math.max(0,+d.room.wall||0)};
       if(sq.length!==raw.length || raw.some((p,k)=>Math.abs(p.x-sq[k].x)>EPS||Math.abs(p.y-sq[k].y)>EPS))
         squaredOnLoad=true;
       state.objects=(d.objects||[]).map(o=>Object.assign({color:COLORS[0],locked:false,lockedSize:false},o,
@@ -1654,7 +1703,7 @@ document.getElementById('btnPng').addEventListener('click',()=>{
 document.getElementById('btnClear').addEventListener('click',()=>{
   if(!hasRoom()&&!state.objects.length)return;
   if(!confirm('Clear the room and all objects?'))return;
-  state.room={pts:[],locked:false,lockedSize:false,name:'Room'};
+  state.room={pts:[],locked:false,lockedSize:false,name:'Room',wall:state.room.wall};
   state.objects=[]; state.sel=null; drawPts=null;
   refreshList(); updStats(); syncPanel(); draw();
 });
@@ -1682,7 +1731,7 @@ window.RoomPlan={
   state, view, select, setTool, draw, fit, objById, delObject, finishRoom,
   polyArea, polyPerimeter, startRename, PX_PER_CM,
   toWorld, toLocal, objCorners, resizeCursor, normRot,
-  undo, redo, commit, hist,
+  undo, redo, commit, hist, wallCm, outerBounds, polyBounds, contentBounds,
   wallAxis, wallLen, wallDir, absorberFor, setWallLength, blockingWalls,
   rectify, dedupe, moveCorner, addJog, removeCorner, axisSnap, isPinned,
   get tool(){return tool;},
@@ -1699,7 +1748,7 @@ refreshList();
 updStats();
 syncPanel();
 commit();                          // baseline: the starting plan
-showHint('Walls are horizontal or vertical. Select a wall to set its length, and pin the ones you want kept.',4600);
+showHint('Wall lengths are internal — measured inside face to inside face. Select a wall to set its length, and pin the ones you want kept.',5200);
 })();
 </script>
 </body>
