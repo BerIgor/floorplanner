@@ -50,6 +50,10 @@
     background:rgba(27,36,48,.88);color:#fff;padding:7px 14px;border-radius:20px;
     font-size:12.5px;pointer-events:none;opacity:0;transition:opacity .25s;max-width:70%;text-align:center}
   #hint.show{opacity:1}
+  #renameBox{position:absolute;display:none;z-index:6;padding:4px 7px;text-align:center;outline:none;
+    font:600 12.5px -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+    color:var(--text);background:#fff;border:1.5px solid var(--accent);border-radius:7px;
+    box-shadow:0 0 0 3px var(--accent-soft),0 4px 14px rgba(16,24,40,.16)}
   #zoombar{position:absolute;right:14px;bottom:14px;display:flex;gap:6px;align-items:center;
     background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:5px 7px;box-shadow:var(--shadow)}
   #zoombar button{width:26px;height:26px;border:0;background:transparent;border-radius:6px;
@@ -75,6 +79,12 @@
   .pair .row label{width:auto;flex:0 0 auto;min-width:13px}
   .pair .row input{min-width:0}
   .unit{color:var(--muted);font-size:12px;flex:0 0 auto}
+  .row input[type=range]{flex:1;min-width:0;accent-color:var(--accent);height:20px;cursor:grab;margin:0}
+  .row input[type=range]:active{cursor:grabbing}
+  .row input[type=range]:disabled{cursor:not-allowed;opacity:.45}
+  .rotsteps{display:flex;gap:5px;flex:1;min-width:0}
+  button.rotstep{flex:1;min-width:0;justify-content:center;padding:5px 0;font-size:12px;
+    font-variant-numeric:tabular-nums}
   .toggle{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;
     border:1px solid var(--line);border-radius:8px;background:var(--panel-2);margin-bottom:8px;
     cursor:pointer;user-select:none}
@@ -94,6 +104,7 @@
   .stat{display:flex;justify-content:space-between;font-size:13px;padding:3px 0;color:var(--muted)}
   .stat b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
   .note{font-size:12px;color:var(--muted);line-height:1.6;margin-top:9px}
+  .note.warn{color:var(--danger)}
 </style>
 </head>
 <body>
@@ -117,7 +128,6 @@
 
     <div class="group">
       <label class="chk" title="Snap points to the grid"><input type="checkbox" id="snapGrid" checked>Grid snap</label>
-      <label class="chk" title="Snap wall directions to 45° steps"><input type="checkbox" id="snapAngle" checked>45° snap</label>
     </div>
 
     <div class="sep"></div>
@@ -140,6 +150,7 @@
   <main>
     <div id="stage">
       <canvas id="cv"></canvas>
+      <input id="renameBox" type="text" maxlength="60" spellcheck="false" autocomplete="off">
       <div id="hint"></div>
       <div id="zoombar">
         <button id="zOut" title="Zoom out">−</button>
@@ -182,7 +193,6 @@ const state = {
   objects: [],                 // {id,name,x,y,w,h,color,locked,lockedSize}
   gridCm: 10,
   snapGrid: true,
-  snapAngle: true,
   sel: null                    // {kind:'room'} | {kind:'vertex',i} | {kind:'edge',i} | {kind:'object',id}
 };
 let nextId = 1;
@@ -216,6 +226,7 @@ const fmt = cm => {
 };
 const clean = n => Math.round(n * 1e4) / 1e4;
 const snapV = v => state.snapGrid ? Math.round(v / state.gridCm) * state.gridCm : v;
+const normRot = d => { const n = Math.round(+d || 0) % 360; return n < 0 ? n + 360 : n; };
 const dist = (a,b) => Math.hypot(a.x-b.x, a.y-b.y);
 
 function showHint(t, ms){
@@ -262,6 +273,164 @@ function distToSeg(p, a, b){
   let t = ((p.x-a.x)*dx + (p.y-a.y)*dy)/L2;
   t = Math.max(0, Math.min(1, t));
   return Math.hypot(p.x-(a.x+t*dx), p.y-(a.y+t*dy));
+}
+
+/* ======================================================================
+   RECTILINEAR WALLS
+
+   Every wall is horizontal or vertical. Wall i runs from pts[i] to pts[i+1],
+   and pts[i].fix pins *that wall's length* against later edits.
+
+   A closed loop cannot have independent wall lengths: the signed horizontal
+   runs must sum to zero, and so must the vertical ones. So changing one
+   length always forces another wall of the same orientation to absorb the
+   difference — the job here is to pick one the user has not pinned.
+   ====================================================================== */
+const EPS = 1e-6;
+const wallEnds = (pts,i) => ({a:pts[i], b:pts[(i+1)%pts.length]});
+function wallAxis(pts,i){
+  const {a,b} = wallEnds(pts,i);
+  return Math.abs(b.x-a.x) >= Math.abs(b.y-a.y) ? 'h' : 'v';
+}
+const wallLen = (pts,i) => { const {a,b}=wallEnds(pts,i); return Math.hypot(b.x-a.x, b.y-a.y); };
+// +1 or -1: which way the wall runs along its own axis
+function wallDir(pts,i){
+  const {a,b} = wallEnds(pts,i), k = wallAxis(pts,i)==='h' ? 'x' : 'y';
+  return b[k] >= a[k] ? 1 : -1;
+}
+const isPinned = (pts,i) => !!pts[i%pts.length].fix;
+
+/* Snap a point so the wall leaving `from` is axis-aligned. */
+function axisSnap(from, x, y){
+  return Math.abs(x-from.x) >= Math.abs(y-from.y) ? {x, y:from.y} : {x:from.x, y};
+}
+
+/* Force a traced outline to be closed and rectilinear: square every segment,
+   add a corner if the closing run needs an L, then drop degenerate walls. */
+function rectify(raw){
+  let pts = raw.map(p=>({x:clean(p.x), y:clean(p.y), fix:!!p.fix}));
+  if (pts.length < 3) return pts;
+  for (let i=1;i<pts.length;i++){
+    const s = axisSnap(pts[i-1], pts[i].x, pts[i].y);
+    pts[i].x = clean(s.x); pts[i].y = clean(s.y);
+  }
+  const last = pts[pts.length-1], first = pts[0];
+  if (Math.abs(last.x-first.x) > EPS && Math.abs(last.y-first.y) > EPS){
+    // the closing run is diagonal — bend it into two axis-aligned walls
+    const lastAxis = Math.abs(last.x-pts[pts.length-2].x) >= Math.abs(last.y-pts[pts.length-2].y) ? 'h' : 'v';
+    pts.push(lastAxis==='h' ? {x:last.x, y:first.y, fix:false} : {x:first.x, y:last.y, fix:false});
+  }
+  return dedupe(pts);
+}
+
+/* Drop zero-length walls and merge walls that carry straight on. */
+function dedupe(pts){
+  let out = pts.filter((p,i)=>{
+    const q = pts[(i+1)%pts.length];
+    return Math.abs(p.x-q.x) > EPS || Math.abs(p.y-q.y) > EPS;
+  });
+  if (out.length < 3) return pts;
+  for (let i=0; i<out.length && out.length>3; ){
+    const p = out[(i-1+out.length)%out.length], q = out[i], r = out[(i+1)%out.length];
+    const straight = (Math.abs(p.x-q.x)<EPS && Math.abs(q.x-r.x)<EPS) ||
+                     (Math.abs(p.y-q.y)<EPS && Math.abs(q.y-r.y)<EPS);
+    // keep a pinned wall's start corner: removing it would merge that wall away
+    if (straight && !q.fix){ out.splice(i,1); } else i++;
+  }
+  return out;
+}
+
+/* Move a corner, dragging the two neighbours just enough to keep both of its
+   walls axis-aligned. */
+function moveCorner(pts, i, x, y){
+  const n = pts.length, p = pts[i];
+  p.x = clean(x); p.y = clean(y);
+  const prev = pts[(i-1+n)%n], next = pts[(i+1)%n];
+  // the wall into p and the wall out of p each keep their own axis
+  if (wallAxis(pts,(i-1+n)%n)==='h') prev.y = p.y; else prev.x = p.x;
+  if (wallAxis(pts,i)==='h') next.y = p.y; else next.x = p.x;
+}
+
+/* The nearest wall parallel to wall i that is free to change length.
+   Searched outward in both directions; ties go forward. */
+function absorberFor(pts, i){
+  const n = pts.length, ax = wallAxis(pts,i);
+  for (let d=1; d<=Math.floor(n/2); d++){
+    for (const j of [(i+d)%n, (i-d+n)%n]){
+      if (j===i) continue;
+      if (wallAxis(pts,j)===ax && !isPinned(pts,j)) return j;
+    }
+  }
+  return -1;
+}
+
+/* Shift a cyclic run of corners along one axis. Because every wall strictly
+   inside the run has *both* endpoints in it, only the two walls at the ends
+   of the run change length. */
+function shiftRun(pts, from, to, axis, delta){
+  const n = pts.length, k = axis==='h' ? 'x' : 'y';
+  for (let s=0, i=from%n; s<n; s++, i=(i+1)%n){
+    pts[i][k] = clean(pts[i][k] + delta);
+    if (i===to%n) break;
+  }
+}
+
+/* Set wall i's length, letting the nearest unpinned parallel wall absorb it.
+   Returns {ok, absorber} or {ok:false, reason}. */
+function setWallLength(pts, i, L){
+  const n = pts.length;
+  if (isPinned(pts,i)) return {ok:false, reason:'pinned'};
+  const cur = wallLen(pts,i);
+  const delta = L - cur;
+  if (Math.abs(delta) < EPS) return {ok:true, absorber:-1};
+  const j = absorberFor(pts,i);
+  if (j < 0) return {ok:false, reason:'blocked'};
+  const axis = wallAxis(pts,i), dir = wallDir(pts,i);
+  // forward: push pts[i+1]..pts[j]; backward: pull pts[j+1]..pts[i] the other way
+  const forward = ((j - i + n) % n) <= ((i - j + n) % n);
+  if (forward) shiftRun(pts, i+1, j, axis, delta*dir);
+  else         shiftRun(pts, j+1, i, axis, -delta*dir);
+  return {ok:true, absorber:j};
+}
+
+/* Removing a corner leaves a diagonal where two walls merge, so re-square the
+   outline afterwards. That can collapse a jog entirely — which is the point. */
+function removeCorner(i){
+  const before = state.room.pts.length;
+  const next = rectify(state.room.pts.filter((_,k)=>k!==i));
+  if (next.length < 4){ showHint('Removing that corner would flatten the room.'); return false; }
+  state.room.pts = next;
+  showHint(next.length < before
+    ? `Corner removed — the outline squared up to ${next.length} corners.`
+    : 'Corner removed.');
+  return true;
+}
+
+/* Names of the pinned walls that are blocking wall i, for the error message. */
+function blockingWalls(pts, i){
+  const ax = wallAxis(pts,i), out = [];
+  for (let j=0;j<pts.length;j++) if (j!==i && wallAxis(pts,j)===ax && isPinned(pts,j)) out.push(j+1);
+  return out;
+}
+
+/* Replace a wall's middle with a rectangular notch (4 new corners), so the
+   outline stays rectilinear and strictly alternating. */
+function addJog(pts, i){
+  const n = pts.length, {a,b} = wallEnds(pts,i);
+  const axis = wallAxis(pts,i), L = wallLen(pts,i);
+  if (L < 8) return false;
+  const depth = Math.min(30, L*0.25);
+  // push the notch towards the inside of the room
+  const mid = {x:(a.x+b.x)/2, y:(a.y+b.y)/2};
+  const nrm = axis==='h' ? {x:0,y:1} : {x:1,y:0};
+  let d = depth;
+  if (!pointInPoly({x:mid.x+nrm.x*2, y:mid.y+nrm.y*2}, pts)) d = -depth;
+  const t1 = 0.35, t2 = 0.65;
+  const at = t => ({x:clean(a.x+(b.x-a.x)*t), y:clean(a.y+(b.y-a.y)*t)});
+  const p1 = at(t1), p2 = at(t2);
+  const off = p => ({x:clean(p.x+nrm.x*d), y:clean(p.y+nrm.y*d), fix:false});
+  pts.splice(i+1, 0, {x:p1.x,y:p1.y,fix:false}, off(p1), off(p2), {x:p2.x,y:p2.y,fix:false});
+  return true;
 }
 
 /* ---------------- canvas sizing ---------------- */
@@ -344,15 +513,17 @@ function drawRoom(){
     const nl = Math.hypot(nx,ny)||1; nx/=nl; ny/=nl;
     if ((mx-cx)*nx + (my-cy)*ny < 0){ nx=-nx; ny=-ny; }
     const off = Math.max(3, 6*view.z) + 11;
-    const txt = fmt(dist(a,b)) + ' cm';
+    const pin = !!a.fix;
+    const txt = (pin?'▮ ':'') + fmt(dist(a,b)) + ' cm';
     const isSel = state.sel && state.sel.kind==='edge' && state.sel.i===i;
     ctx.save();
     ctx.translate(mx+nx*off, my+ny*off);
     ctx.rotate(ang);
     const tw = ctx.measureText(txt).width;
-    ctx.fillStyle = isSel ? '#2f6df6' : 'rgba(255,255,255,.93)';
+    ctx.fillStyle = isSel ? '#2f6df6' : (pin ? '#fdf4e3' : 'rgba(255,255,255,.93)');
     ctx.fillRect(-tw/2-4,-8,tw+8,15);
-    ctx.fillStyle = isSel ? '#fff' : (locked?'#a9741f':'#5a6674');
+    if (pin && !isSel){ ctx.strokeStyle='#e9cf9c'; ctx.lineWidth=1; ctx.strokeRect(-tw/2-4,-8,tw+8,15); }
+    ctx.fillStyle = isSel ? '#fff' : (pin ? '#a9741f' : (locked?'#a9741f':'#5a6674'));
     ctx.textAlign='center';
     ctx.fillText(txt,0,3.5);
     ctx.restore();
@@ -440,8 +611,37 @@ function centroid(pts){
   return {x: cx/(6*a), y: cy/(6*a)};
 }
 
+/* ---------------- object geometry (rotation-aware) ----------------
+   x/y/w/h describe the upright rectangle; rot spins it about its centre. */
+const objRot = o => ((+o.rot || 0) * Math.PI) / 180;
+const objCentre = o => ({x:o.x + o.w/2, y:o.y + o.h/2});
+
+// upright object space -> world
+function toWorld(o, p){
+  const a = objRot(o); if (!a) return {x:p.x, y:p.y};
+  const c = objCentre(o), cs = Math.cos(a), sn = Math.sin(a);
+  const dx = p.x-c.x, dy = p.y-c.y;
+  return {x: c.x + dx*cs - dy*sn, y: c.y + dx*sn + dy*cs};
+}
+// world -> upright object space
+function toLocal(o, p){
+  const a = -objRot(o); if (!a) return {x:p.x, y:p.y};
+  const c = objCentre(o), cs = Math.cos(a), sn = Math.sin(a);
+  const dx = p.x-c.x, dy = p.y-c.y;
+  return {x: c.x + dx*cs - dy*sn, y: c.y + dx*sn + dy*cs};
+}
+function objCorners(o){
+  return [{x:o.x,y:o.y},{x:o.x+o.w,y:o.y},{x:o.x+o.w,y:o.y+o.h},{x:o.x,y:o.y+o.h}]
+    .map(p => toWorld(o,p));
+}
+
 function drawObject(o){
-  const x=sx(o.x), y=sy(o.y), w=o.w*PX_PER_CM*view.z, h=o.h*PX_PER_CM*view.z;
+  const w=o.w*PX_PER_CM*view.z, h=o.h*PX_PER_CM*view.z;
+  const c=objCentre(o);
+  ctx.save();
+  ctx.translate(sx(c.x), sy(c.y));
+  ctx.rotate(objRot(o));
+  const x=-w/2, y=-h/2;                 // draw upright around the rotated origin
   ctx.fillStyle = o.color || COLORS[0];
   ctx.fillRect(x,y,w,h);
   ctx.strokeStyle = o.locked ? '#c8892a' : '#8a96a6';
@@ -468,6 +668,7 @@ function drawObject(o){
   }
   ctx.textAlign='left';
   if (o.locked) lockBadge(x+w-10, y+10);
+  ctx.restore();
 }
 
 function lockBadge(x,y){
@@ -483,10 +684,15 @@ function drawSelection(){
   if (!s) return;
   if (s.kind === 'object'){
     const o = objById(s.id); if (!o) return;
+    const w=o.w*PX_PER_CM*view.z, h=o.h*PX_PER_CM*view.z, c=objCentre(o);
     ctx.save();
     ctx.strokeStyle = o.locked?'#c8892a':'#2f6df6';
     ctx.lineWidth=1.4; ctx.setLineDash([4,3]);
-    ctx.strokeRect(sx(o.x)-2.5, sy(o.y)-2.5, o.w*PX_PER_CM*view.z+5, o.h*PX_PER_CM*view.z+5);
+    ctx.save();
+    ctx.translate(sx(c.x), sy(c.y));
+    ctx.rotate(objRot(o));
+    ctx.strokeRect(-w/2-2.5, -h/2-2.5, w+5, h+5);
+    ctx.restore();
     ctx.setLineDash([]);
     if (!o.locked && !o.lockedSize){
       objHandles(o).forEach(h => {
@@ -514,7 +720,8 @@ function objHandles(o){
   const {x,y,w,h}=o;
   return [{k:'nw',x,y},{k:'n',x:x+w/2,y},{k:'ne',x:x+w,y},
           {k:'w',x,y:y+h/2},{k:'e',x:x+w,y:y+h/2},
-          {k:'sw',x,y:y+h},{k:'s',x:x+w/2,y:y+h},{k:'se',x:x+w,y:y+h}];
+          {k:'sw',x,y:y+h},{k:'s',x:x+w/2,y:y+h},{k:'se',x:x+w,y:y+h}]
+    .map(p => { const q = toWorld(o,p); return {k:p.k, x:q.x, y:q.y}; });
 }
 
 function drawOutlinePreview(){
@@ -584,10 +791,17 @@ function hitEdge(px,py){
 function hitObject(px,py){
   const p = {x:wx(px), y:wy(py)};
   for (let i=state.objects.length-1;i>=0;i--){
-    const o = state.objects[i];
-    if (p.x>=o.x && p.x<=o.x+o.w && p.y>=o.y && p.y<=o.y+o.h) return o;
+    const o = state.objects[i], q = toLocal(o, p);
+    if (q.x>=o.x && q.x<=o.x+o.w && q.y>=o.y && q.y<=o.y+o.h) return o;
   }
   return null;
+}
+/* Which resize cursor a handle should show, once the object's rotation is
+   taken into account. Screen angles run clockwise from east. */
+const HANDLE_ANGLE = {e:0, se:45, s:90, sw:135, w:180, nw:225, n:270, ne:315};
+function resizeCursor(k, o){
+  const a = HANDLE_ANGLE[k] + (o ? (+o.rot||0) : 0);
+  return ['ew','nwse','ns','nesw'][((Math.round(a/45) % 4) + 4) % 4] + '-resize';
 }
 function hitObjHandle(px,py){
   const s = state.sel;
@@ -604,16 +818,18 @@ function hitObjHandle(px,py){
    ====================================================================== */
 let drag = null;
 let spaceDown = false;
+let shiftDown = false;
 const pos = e => { const r = cv.getBoundingClientRect(); return {px:e.clientX-r.left, py:e.clientY-r.top}; };
 
-function angleSnap(from, x, y, shift){
-  if (!state.snapAngle || shift) return {x,y};
-  const dx=x-from.x, dy=y-from.y, L=Math.hypot(dx,dy);
-  if (L<1e-6) return {x,y};
-  const step = Math.PI/4;
-  const a = Math.round(Math.atan2(dy,dx)/step)*step;
-  return {x: from.x+Math.cos(a)*L, y: from.y+Math.sin(a)*L};
+/* Next traced corner: square to the previous one, grid-snapping only the axis
+   that is actually free (so the shared coordinate stays exact). */
+function tracePoint(prev, px, py, shift){
+  const sn = axisSnap(prev, wx(px), wy(py));
+  return Math.abs(sn.y-prev.y) < EPS
+    ? {x: shift?sn.x:snapV(sn.x), y: prev.y}
+    : {x: prev.x, y: shift?sn.y:snapV(sn.y)};
 }
+
 
 cv.addEventListener('pointerdown', e => {
   cv.setPointerCapture(e.pointerId);
@@ -632,8 +848,7 @@ cv.addEventListener('pointerdown', e => {
   if (tool === 'room'){
     let p = {x:snapV(wx(px)), y:snapV(wy(py))};
     if (drawPts && drawPts.length){
-      const sn = angleSnap(drawPts[drawPts.length-1], wx(px), wy(py), e.shiftKey);
-      p = {x: e.shiftKey?sn.x:snapV(sn.x), y: e.shiftKey?sn.y:snapV(sn.y)};
+      p = tracePoint(drawPts[drawPts.length-1], px, py, e.shiftKey);
       // click the first point again to close the room
       if (drawPts.length>=3 && Math.hypot(sx(drawPts[0].x)-px, sy(drawPts[0].y)-py) <= 11){
         finishRoom();
@@ -703,8 +918,7 @@ cv.addEventListener('pointermove', e => {
   const {px,py} = pos(e);
 
   if (tool === 'room' && drawPts && drawPts.length){
-    const sn = angleSnap(drawPts[drawPts.length-1], wx(px), wy(py), e.shiftKey);
-    hoverPt = {x: e.shiftKey?sn.x:snapV(sn.x), y: e.shiftKey?sn.y:snapV(sn.y)};
+    hoverPt = tracePoint(drawPts[drawPts.length-1], px, py, e.shiftKey);
     draw();
     return;
   }
@@ -713,9 +927,7 @@ cv.addEventListener('pointermove', e => {
     if (tool !== 'select'){ cv.style.cursor='crosshair'; return; }
     const hk = hitObjHandle(px,py);
     if (hk){
-      const map={nw:'nwse-resize',se:'nwse-resize',ne:'nesw-resize',sw:'nesw-resize',
-                 n:'ns-resize',s:'ns-resize',e:'ew-resize',w:'ew-resize'};
-      cv.style.cursor = map[hk];
+      cv.style.cursor = resizeCursor(hk, objById(state.sel.id));
     }
     else if (hitVertex(px,py)>=0) cv.style.cursor='move';
     else {
@@ -753,13 +965,8 @@ cv.addEventListener('pointermove', e => {
 
   if (drag.mode==='vertex'){
     let x=wx(px), y=wy(py);
-    const pts = state.room.pts;
-    const prev = pts[(drag.i-1+pts.length)%pts.length];
-    if (state.snapAngle && !e.shiftKey && pts.length>1){
-      const sn = angleSnap(prev, x, y, false); x=sn.x; y=sn.y;
-    }
     if (!e.shiftKey){ x=snapV(x); y=snapV(y); }
-    pts[drag.i] = {x:clean(x), y:clean(y)};
+    moveCorner(state.room.pts, drag.i, x, y);   // neighbours follow, walls stay square
     syncPanel(); updStats(); draw();
     return;
   }
@@ -788,7 +995,9 @@ cv.addEventListener('pointermove', e => {
 
   if (drag.mode==='objresize'){
     const o=drag.o, st=drag.start, k=drag.key;
-    let mx=wx(px), my=wy(py);
+    // resize along the object's own axes, so a rotated object grows the way it looks
+    const m = toLocal(st, {x:wx(px), y:wy(py)});
+    let mx=m.x, my=m.y;
     if (!e.shiftKey){ mx=snapV(mx); my=snapV(my); }
     let x1=st.x, y1=st.y, x2=st.x+st.w, y2=st.y+st.h;
     if (k.includes('w')) x1=mx;
@@ -796,8 +1005,11 @@ cv.addEventListener('pointermove', e => {
     if (k.includes('n')) y1=my;
     if (k.includes('s')) y2=my;
     const r = norm(x1,y1,x2,y2);
-    o.x=clean(r.x); o.y=clean(r.y);
-    o.w=clean(Math.max(1,r.w)); o.h=clean(Math.max(1,r.h));
+    const w=Math.max(1,r.w), h=Math.max(1,r.h);
+    // the local rect moved, so re-derive the world centre to keep the fixed edge put
+    const c = toWorld(st, {x:r.x+r.w/2, y:r.y+r.h/2});
+    o.w=clean(w); o.h=clean(h);
+    o.x=clean(c.x-w/2); o.y=clean(c.y-h/2);
     syncPanel(); draw();
   }
 });
@@ -811,7 +1023,7 @@ cv.addEventListener('pointerup', e => {
     if (r.w>=2 && r.h>=2){
       const o = {id:uid(), name:'Object '+(state.objects.length+1),
                  x:clean(r.x), y:clean(r.y), w:clean(r.w), h:clean(r.h),
-                 color:COLORS[state.objects.length%COLORS.length], locked:false, lockedSize:false};
+                 rot:0, color:COLORS[state.objects.length%COLORS.length], locked:false, lockedSize:false};
       state.objects.push(o);
       select({kind:'object', id:o.id});
       setTool('select');
@@ -824,30 +1036,92 @@ cv.addEventListener('pointerup', e => {
 cv.addEventListener('pointercancel', ()=>{ drag=null; draw(); });
 cv.addEventListener('contextmenu', e=>e.preventDefault());
 
-// double-click closes the outline, or adds/removes a corner
+// double-click renames an object, closes the outline, or adds/removes a corner
 cv.addEventListener('dblclick', e => {
   const {px,py} = pos(e);
   if (tool==='room' && drawPts && drawPts.length>=3){ finishRoom(); return; }
-  if (tool!=='select' || !hasRoom() || state.room.locked || state.room.lockedSize) return;
+  if (tool!=='select') return;
+
+  // corners and walls keep their own double-click actions, so they win the hit test
+  const shapeable = hasRoom() && !state.room.locked && !state.room.lockedSize;
   const vi = hitVertex(px,py);
   if (vi>=0){
-    if (state.room.pts.length<=3){ showHint('A room needs at least 3 corners.'); return; }
-    state.room.pts.splice(vi,1);
+    if (!shapeable) return;
+    if (state.room.pts.length<=4){ showHint('A squared room needs at least 4 corners.'); return; }
+    removeCorner(vi);
     select(null); updStats(); syncPanel(); draw();
-    showHint('Corner removed.');
     return;
   }
+  const ob = hitObject(px,py);
+  if (ob){
+    select({kind:'object', id:ob.id});
+    draw();
+    startRename(ob);
+    return;
+  }
+  if (!shapeable) return;
   const ei = hitEdge(px,py);
   if (ei>=0){
-    const pts=state.room.pts;
-    const a=pts[ei], b=pts[(ei+1)%pts.length];
-    let mid={x:snapV((a.x+b.x)/2), y:snapV((a.y+b.y)/2)};
-    pts.splice(ei+1,0,{x:clean(mid.x), y:clean(mid.y)});
-    select({kind:'vertex', i:ei+1});
+    // a lone corner would just split the wall in two straight halves, so add a jog
+    if (!addJog(state.room.pts, ei)){ showHint('This wall is too short to add a jog.'); return; }
+    select({kind:'vertex', i:(ei+2)%state.room.pts.length});
     updStats(); syncPanel(); draw();
-    showHint('Corner added — drag it to shape the room.');
+    showHint('Jog added — drag its corners to shape the room.');
   }
 });
+
+/* ---------------- inline rename ---------------- */
+const renameBox = document.getElementById('renameBox');
+let renaming = null;              // {id, prev} while the editor is open
+
+function startRename(o){
+  renaming = {id:o.id, prev:o.name||''};
+  const ow = o.w*PX_PER_CM*view.z, oh = o.h*PX_PER_CM*view.z;
+  const bw = Math.max(104, Math.min(ow, 240));
+  const SW = cv.width/dpr, SH = cv.height/dpr;
+  const clamp = (v,max) => Math.round(Math.max(4, Math.min(v, max-4)));
+  renameBox.style.width = bw+'px';
+  renameBox.style.left = clamp(sx(o.x)+ow/2 - bw/2, SW-bw)+'px';
+  renameBox.style.top  = clamp(sy(o.y)+oh/2 - 14, SH-28)+'px';
+  renameBox.style.display = 'block';
+  renameBox.value = renaming.prev;
+  renameBox.focus(); renameBox.select();
+  showHint('Type a new name — Enter to keep it, Esc to cancel.');
+}
+
+function endRename(){
+  if (!renaming) return null;
+  const o = objById(renaming.id), prev = renaming.prev;
+  renaming = null;                // cleared first, so the blur below is a no-op
+  renameBox.style.display = 'none';
+  renameBox.blur();
+  refreshList(); syncPanel(); draw();
+  return {o, prev};
+}
+
+function applyRename(){
+  const r = endRename();
+  if (r && r.o){
+    r.o.name = renameBox.value.trim() || r.prev || 'Object';
+    refreshList(); syncPanel(); draw();
+  }
+}
+
+function cancelRename(){
+  const r = endRename();
+  if (r && r.o){ r.o.name = r.prev; refreshList(); syncPanel(); draw(); }
+}
+
+// keep the canvas in sync as you type
+renameBox.addEventListener('input', ()=>{
+  const o = renaming && objById(renaming.id);
+  if (o){ o.name = renameBox.value; refreshList(); draw(); }
+});
+renameBox.addEventListener('keydown', e => {
+  if (e.key==='Enter'){ e.preventDefault(); applyRename(); }
+  else if (e.key==='Escape'){ e.preventDefault(); cancelRename(); }
+});
+renameBox.addEventListener('blur', applyRename);
 
 function norm(x1,y1,x2,y2){
   return {x:Math.min(x1,x2), y:Math.min(y1,y2), w:Math.abs(x2-x1), h:Math.abs(y2-y1)};
@@ -855,17 +1129,20 @@ function norm(x1,y1,x2,y2){
 
 function finishRoom(){
   if (!drawPts || drawPts.length<3){ showHint('A room needs at least 3 corners.'); return; }
-  state.room.pts = drawPts.map(p=>({x:p.x,y:p.y}));
+  const sq = rectify(drawPts);
+  if (sq.length<4){ showHint('That outline is too thin — a squared room needs at least 4 corners.'); return; }
+  state.room.pts = sq;
   drawPts=null; hoverPt=null;
   setTool('select');
   select({kind:'room'});
   hideHint();
   updStats(); refreshList(); syncPanel(); fit();
-  showHint('Room created. Drag corners to reshape, or double-click a wall to add a corner.', 3600);
+  showHint('Room created — walls are kept square. Drag corners to reshape, or double-click a wall to add a jog.', 3600);
 }
 
 cv.addEventListener('wheel', e => {
   e.preventDefault();
+  if (renaming) applyRename();     // the editor is anchored to screen coords, so don't let it drift
   const {px,py}=pos(e);
   const b={x:wx(px), y:wy(py)};
   view.z = Math.min(8, Math.max(0.03, view.z*Math.pow(0.999, e.deltaY*(e.ctrlKey?4:1.6))));
@@ -913,6 +1190,16 @@ function syncPanel(){
          <div class="row"><label>H</label><input type="number" step="1" min="1" id="pH" value="${fmt(o.h)}" ${sd}><span class="unit">cm</span></div>
        </div>
        <div style="height:11px"></div>
+       <div class="row"><label>Rotate</label>
+         <input type="number" step="1" id="pRot" value="${normRot(o.rot)}" ${pd}><span class="unit">°</span></div>
+       <div class="row"><label></label>
+         <input type="range" min="0" max="359" step="1" id="pRotR" value="${normRot(o.rot)}" ${pd}
+                title="Drag to rotate — hold Shift for 15° steps"></div>
+       <div class="row"><label></label><div class="rotsteps" id="rotSteps">
+         ${[-90,-45,45,90].map(d=>`<button class="btn rotstep" data-d="${d}" ${pd}>${d>0?'+':'−'}${Math.abs(d)}°</button>`).join('')}
+         <button class="btn rotstep" data-r="0" ${pd} title="Back to upright">0°</button>
+       </div></div>
+       <div style="height:11px"></div>
        <div class="row"><label>Colour</label><div class="swatches" id="sw">
          ${COLORS.map(c=>`<div class="sw ${c===o.color?'sel':''}" data-c="${c}" style="background:${c}"></div>`).join('')}
        </div></div>
@@ -943,52 +1230,76 @@ function syncPanel(){
        <button class="btn fullbtn" id="btnSelRoom">Select whole room</button>
        <button class="btn danger fullbtn" id="btnDelV" ${state.room.pts.length<=3?'disabled':''}>
          <svg class="ic" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>Remove corner</button>
-       <div class="note">Double-click a wall to add a corner; double-click a corner to remove it.</div>`;
+       <div class="note">Double-click a wall to add a jog; double-click a corner to remove it. Walls stay square.</div>`;
     const $=id=>document.getElementById(id);
     const upd=()=>{
       const x=parseFloat($('vX').value), y=parseFloat($('vY').value);
-      if(!isNaN(x)) state.room.pts[s.i].x=clean(x);
-      if(!isNaN(y)) state.room.pts[s.i].y=clean(y);
+      const p=state.room.pts[s.i];
+      moveCorner(state.room.pts, s.i, isNaN(x)?p.x:x, isNaN(y)?p.y:y);
       updStats(); draw();
     };
     ['vX','vY'].forEach(id=>{ const el=$(id); if(el){el.addEventListener('input',upd);el.addEventListener('change',upd);} });
     $('btnSelRoom').addEventListener('click',()=>{select({kind:'room'});draw();});
     const bd=$('btnDelV');
     if(bd) bd.addEventListener('click',()=>{
-      if(state.room.pts.length<=3){showHint('A room needs at least 3 corners.');return;}
-      state.room.pts.splice(s.i,1); select(null); updStats(); draw();
+      if(state.room.pts.length<=4){showHint('A squared room needs at least 4 corners.');return;}
+      removeCorner(s.i); select(null); updStats(); syncPanel(); draw();
     });
     return;
   }
 
   if (s.kind === 'edge'){
     const pts=state.room.pts;
-    const a=pts[s.i], b=pts[(s.i+1)%pts.length];
-    const len=dist(a,b);
-    const ang=(Math.atan2(b.y-a.y,b.x-a.x)*180/Math.PI+360)%360;
-    const d = (state.room.locked||state.room.lockedSize)?'disabled':'';
+    const len=wallLen(pts,s.i);
+    const axis=wallAxis(pts,s.i);
+    const roomLocked = state.room.locked||state.room.lockedSize;
+    const pinned = isPinned(pts,s.i);
+    const d = roomLocked?'disabled':'';
+    const ld = (roomLocked||pinned)?'disabled':'';
+    const j = absorberFor(pts,s.i);
+    const blockers = blockingWalls(pts,s.i);
+    const note = pinned
+      ? 'This wall\'s length is fixed. Unpin it to change it.'
+      : j>=0
+        ? `Changing this length will resize wall #${j+1} to keep the room closed.`
+        : `No wall can absorb a change — wall${blockers.length>1?'s':''} #${blockers.join(', #')} ${blockers.length>1?'are':'is'} pinned.`;
     propBody.innerHTML =
-      `<div class="row"><label>Wall</label><b>#${s.i+1} of ${pts.length}</b></div>
+      `<div class="row"><label>Wall</label><b>#${s.i+1} of ${pts.length}</b>
+         <span class="unit" style="margin-left:auto">${axis==='h'?'Horizontal':'Vertical'}</span></div>
        <div style="height:11px"></div>
-       <div class="row"><label>Length</label><input type="number" step="1" min="1" id="eLen" value="${fmt(len)}" ${d}><span class="unit">cm</span></div>
-       <div class="row"><label>Angle</label><input type="number" step="1" id="eAng" value="${Math.round(ang)}" ${d}><span class="unit">°</span></div>
-       <div class="note">Changing a wall moves its end corner. Neighbouring walls follow.</div>
+       <div class="row"><label>Length</label><input type="number" step="1" min="1" id="eLen" value="${fmt(len)}" ${ld}><span class="unit">cm</span></div>
+       <div class="toggle ${pinned?'on':''}" id="tgPin" ${roomLocked?'style="opacity:.5"':''}>
+         <span>${lockIcon} Fix this length</span>
+         <input type="checkbox" ${pinned?'checked':''} tabindex="-1" style="pointer-events:none"></div>
+       <div class="note ${j<0&&!pinned?'warn':''}" id="eNote">${note}</div>
        <div style="height:12px"></div>
-       <button class="btn fullbtn" id="btnAddV" ${d}>Add corner on this wall</button>
+       <button class="btn fullbtn" id="btnAddV" ${d}>Add a jog to this wall</button>
        <button class="btn fullbtn" id="btnSelRoom2">Select whole room</button>`;
     const $=id=>document.getElementById(id);
+    const el=$('eLen');
     const upd=()=>{
-      const L=Math.max(1,parseFloat($('eLen').value)||1);
-      const A=(parseFloat($('eAng').value)||0)*Math.PI/180;
-      const j=(s.i+1)%pts.length;
-      pts[j]={x:clean(a.x+Math.cos(A)*L), y:clean(a.y+Math.sin(A)*L)};
+      const L=Math.max(1,parseFloat(el.value)||1);
+      const r=setWallLength(pts, s.i, L);
+      if(!r.ok){
+        el.value=fmt(wallLen(pts,s.i));
+        showHint(r.reason==='pinned'
+          ? 'This wall\'s length is fixed — unpin it first.'
+          : `Wall #${s.i+1} can't change: wall${blockers.length>1?'s':''} #${blockers.join(', #')} ${blockers.length>1?'are':'is'} pinned. Unpin one to make room.`);
+        return;
+      }
       updStats(); draw();
     };
-    ['eLen','eAng'].forEach(id=>{const el=$(id); if(el){el.addEventListener('input',upd);el.addEventListener('change',upd);}});
+    if(el){ el.addEventListener('change',upd);
+            el.addEventListener('keydown',ev=>{ if(ev.key==='Enter') upd(); }); }
+    $('tgPin').addEventListener('click',()=>{
+      if(roomLocked){showHint('The room is locked — unlock it first.');return;}
+      pts[s.i].fix=!pts[s.i].fix; syncPanel(); draw();
+    });
     const ab=$('btnAddV');
     if(ab) ab.addEventListener('click',()=>{
-      pts.splice(s.i+1,0,{x:clean((a.x+b.x)/2), y:clean((a.y+b.y)/2)});
-      select({kind:'vertex',i:s.i+1}); updStats(); draw();
+      if(!addJog(pts,s.i)){showHint('This wall is too short to add a jog.');return;}
+      select({kind:'vertex',i:(s.i+2)%pts.length}); updStats(); draw();
+      showHint('Jog added — drag its corners to shape it.');
     });
     $('btnSelRoom2').addEventListener('click',()=>{select({kind:'room'});draw();});
     return;
@@ -1038,6 +1349,31 @@ function wireObject(o){
   num($('pY'),v=>o.y=clean(v));
   num($('pW'),v=>o.w=clean(Math.max(1,v)));
   num($('pH'),v=>o.h=clean(Math.max(1,v)));
+  /* rotation: the slider and the number box drive the same value, and each
+     mirrors the other without a full panel rebuild (that would kill the drag) */
+  const rotN=$('pRot'), rotR=$('pRotR');
+  const setRot=(v,from)=>{
+    o.rot=normRot(v);
+    if(from!==rotN) rotN.value=o.rot;
+    if(from!==rotR) rotR.value=o.rot;
+    draw();
+  };
+  // Shift gives coarse 15° steps while dragging the slider
+  if(rotR) rotR.addEventListener('input',e=>{
+    const v=+e.target.value;
+    setRot(shiftDown ? Math.round(v/15)*15 : v, shiftDown ? null : rotR);
+  });
+  if(rotN){
+    const ap=()=>{const v=parseFloat(rotN.value); if(!isNaN(v)) setRot(v,rotN);};
+    rotN.addEventListener('input',ap);
+    rotN.addEventListener('change',()=>{rotN.value=normRot(rotN.value); setRot(rotN.value,rotN);});
+  }
+  const steps=$('rotSteps');
+  if(steps) steps.addEventListener('click',e=>{
+    const b=e.target.closest('button'); if(!b||b.disabled)return;
+    setRot(b.dataset.r!==undefined ? +b.dataset.r : o.rot+(+b.dataset.d), null);
+  });
+
   const sw=$('sw');
   if(sw) sw.addEventListener('click',e=>{
     const t=e.target.closest('.sw'); if(!t)return;
@@ -1104,7 +1440,7 @@ function setTool(t){
   tool=t;
   document.querySelectorAll('#tools .tool').forEach(b=>b.classList.toggle('active',b.dataset.tool===t));
   cv.style.cursor = t==='select'?'default':'crosshair';
-  if (t==='room') showHint('Click each corner of the room. Click the first corner again (or double-click) to close it.',0);
+  if (t==='room') showHint('Click each corner — walls snap to horizontal or vertical. Click the first corner again (or double-click) to close it.',0);
   else if (t==='object') showHint('Drag inside the room to place an object.');
   else hideHint();
   syncPanel(); draw();
@@ -1112,7 +1448,6 @@ function setTool(t){
 document.querySelectorAll('#tools .tool').forEach(b=>b.addEventListener('click',()=>setTool(b.dataset.tool)));
 
 document.getElementById('snapGrid').addEventListener('change',e=>state.snapGrid=e.target.checked);
-document.getElementById('snapAngle').addEventListener('change',e=>state.snapAngle=e.target.checked);
 document.getElementById('gridSize').addEventListener('change',e=>{
   const v=parseFloat(e.target.value);
   state.gridCm=(!isNaN(v)&&v>0)?v:10;
@@ -1120,6 +1455,7 @@ document.getElementById('gridSize').addEventListener('change',e=>{
 });
 
 window.addEventListener('keydown',e=>{
+  shiftDown = e.shiftKey;              // read by the rotation slider, so track it even while typing
   const typing=/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
   if(e.code==='Space'&&!typing){spaceDown=true;if(!drag)cv.style.cursor='grab';e.preventDefault();}
   if(typing)return;
@@ -1133,6 +1469,7 @@ window.addEventListener('keydown',e=>{
   }
 });
 window.addEventListener('keyup',e=>{
+  shiftDown = e.shiftKey;
   if(e.code==='Space'){spaceDown=false;if(!drag)cv.style.cursor=tool==='select'?'default':'crosshair';}
 });
 
@@ -1152,7 +1489,7 @@ document.getElementById('zFit').addEventListener('click',fit);
 
 function contentBounds(){
   let pts = hasRoom()? state.room.pts.slice() : [];
-  state.objects.forEach(o=>{pts.push({x:o.x,y:o.y},{x:o.x+o.w,y:o.y+o.h});});
+  state.objects.forEach(o=>{objCorners(o).forEach(c=>pts.push(c));});
   if(!pts.length) return null;
   return polyBounds(pts);
 }
@@ -1180,17 +1517,25 @@ document.getElementById('btnLoad').addEventListener('click',()=>document.getElem
 document.getElementById('fileIn').addEventListener('change',e=>{
   const f=e.target.files[0]; if(!f)return;
   const rd=new FileReader();
+  let squaredOnLoad=false;
   rd.onload=()=>{
     try{
       const d=JSON.parse(rd.result);
       if(!d||!d.room||!Array.isArray(d.room.pts)) throw new Error('bad');
-      state.room={name:d.room.name||'Room', pts:d.room.pts.map(p=>({x:+p.x,y:+p.y})),
+      const raw=d.room.pts.map(p=>({x:+p.x,y:+p.y,fix:!!p.fix}));
+      const sq=rectify(raw);
+      state.room={name:d.room.name||'Room', pts:sq,
                   locked:!!d.room.locked, lockedSize:!!d.room.lockedSize};
-      state.objects=(d.objects||[]).map(o=>Object.assign({color:COLORS[0],locked:false,lockedSize:false},o,{id:uid()}));
+      if(sq.length!==raw.length || raw.some((p,k)=>Math.abs(p.x-sq[k].x)>EPS||Math.abs(p.y-sq[k].y)>EPS))
+        squaredOnLoad=true;
+      state.objects=(d.objects||[]).map(o=>Object.assign({color:COLORS[0],locked:false,lockedSize:false},o,
+                                                          {id:uid(), rot:normRot(o.rot)}));
       if(d.gridCm){state.gridCm=d.gridCm;document.getElementById('gridSize').value=d.gridCm;}
       state.sel=null; drawPts=null;
       refreshList(); updStats(); syncPanel(); fit();
-      showHint('Loaded room with '+state.room.pts.length+' corners and '+state.objects.length+' object(s).');
+      showHint(squaredOnLoad
+        ? 'Loaded — some walls were not square, so the outline was straightened to '+state.room.pts.length+' corners.'
+        : 'Loaded room with '+state.room.pts.length+' corners and '+state.objects.length+' object(s).', squaredOnLoad?5200:0);
     }catch(err){ showHint('That file is not a valid room plan.'); }
     e.target.value='';
   };
@@ -1233,19 +1578,23 @@ function stamp(){const d=new Date(),p=n=>String(n).padStart(2,'0');
 /* ---------------- demo (an L-shaped room) ---------------- */
 function demo(){
   state.room.name='Living Room';
-  state.room.pts=[{x:0,y:0},{x:520,y:0},{x:520,y:300},{x:320,y:300},{x:320,y:460},{x:0,y:460}];
-  state.objects.push({id:uid(),name:'Sofa',x:40,y:340,w:220,h:90,color:COLORS[0],locked:false,lockedSize:false});
-  state.objects.push({id:uid(),name:'Table',x:120,y:120,w:140,h:80,color:COLORS[1],locked:false,lockedSize:false});
-  state.objects.push({id:uid(),name:'Cabinet',x:380,y:30,w:110,h:45,color:COLORS[2],locked:false,lockedSize:false});
+  state.room.pts=[{x:0,y:0},{x:520,y:0},{x:520,y:300},{x:320,y:300},{x:320,y:460},{x:0,y:460}]
+    .map(p=>({x:p.x,y:p.y,fix:false}));
+  state.objects.push({id:uid(),name:'Sofa',x:40,y:340,w:220,h:90,rot:0,color:COLORS[0],locked:false,lockedSize:false});
+  state.objects.push({id:uid(),name:'Table',x:120,y:120,w:140,h:80,rot:0,color:COLORS[1],locked:false,lockedSize:false});
+  state.objects.push({id:uid(),name:'Cabinet',x:380,y:30,w:110,h:45,rot:0,color:COLORS[2],locked:false,lockedSize:false});
 }
 
 /* scripting hook for tests */
 window.RoomPlan={
   state, view, select, setTool, draw, fit, objById, delObject, finishRoom,
-  polyArea, polyPerimeter,
+  polyArea, polyPerimeter, startRename, PX_PER_CM,
+  toWorld, toLocal, objCorners, resizeCursor, normRot,
+  wallAxis, wallLen, wallDir, absorberFor, setWallLength, blockingWalls,
+  rectify, dedupe, moveCorner, addJog, removeCorner, axisSnap, isPinned,
   get tool(){return tool;},
   get drawPts(){return drawPts;},
-  addObject(x,y,w,h,o){const n=Object.assign({id:uid(),name:'Object',x,y,w,h,color:COLORS[0],locked:false,lockedSize:false},o||{});
+  addObject(x,y,w,h,o){const n=Object.assign({id:uid(),name:'Object',x,y,w,h,rot:0,color:COLORS[0],locked:false,lockedSize:false},o||{});
     state.objects.push(n);refreshList();draw();return n;}
 };
 
@@ -1256,7 +1605,7 @@ updZoom();
 refreshList();
 updStats();
 syncPanel();
-showHint('Drag corners to reshape the room. Double-click a wall to add a corner.',4000);
+showHint('Walls are horizontal or vertical. Select a wall to set its length, and pin the ones you want kept.',4600);
 })();
 </script>
 </body>
