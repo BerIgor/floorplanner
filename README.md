@@ -4,11 +4,11 @@ A small collection of self-contained browser tools, hosted on GitHub Pages.
 
 **Live:** https://berigor.github.io/hpage/
 
-| Page | URL | Source |
+| Page | Live | Source |
 | --- | --- | --- |
-| Landing page | `/` | `index.html` |
-| Floor Planner | `/floor-planner/` | `floor-planner/index.html` |
-| Wheel of Fortune | `/wheel-of-fortune/` | `wheel-of-fortune/index.html` |
+| Landing page | [`/`](https://berigor.github.io/hpage/) | `index.html` |
+| Floor Planner | [`/floor-planner/`](https://berigor.github.io/hpage/floor-planner/) | `floor-planner/index.html` |
+| Wheel of Fortune | [`/wheel-of-fortune/`](https://berigor.github.io/hpage/wheel-of-fortune/) | `wheel-of-fortune/index.html` |
 
 ## Adding a page
 
