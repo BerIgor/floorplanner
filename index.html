@@ -127,6 +127,17 @@
     <div class="sep"></div>
 
     <div class="group">
+      <button class="btn" id="btnUndo" title="Undo (Ctrl/Cmd+Z)" disabled>
+        <svg class="ic" viewBox="0 0 24 24"><path d="M9 14l-5-5 5-5"/><path d="M4 9h9a6 6 0 0 1 0 12h-3"/></svg>Undo
+      </button>
+      <button class="btn" id="btnRedo" title="Redo (Ctrl/Cmd+Shift+Z)" disabled>
+        <svg class="ic" viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M20 9h-9a6 6 0 0 0 0 12h3"/></svg>Redo
+      </button>
+    </div>
+
+    <div class="sep"></div>
+
+    <div class="group">
       <label class="chk" title="Snap points to the grid"><input type="checkbox" id="snapGrid" checked>Grid snap</label>
     </div>
 
@@ -1070,6 +1081,81 @@ cv.addEventListener('dblclick', e => {
   }
 });
 
+/* ======================================================================
+   UNDO / REDO
+
+   Snapshots of the model (room + objects) rather than inverse operations —
+   with this many mutation sites, a diffed snapshot cannot drift out of sync
+   the way hand-written undo steps would.
+
+   commit() is cheap and idempotent: it serialises, compares with the top of
+   the stack, and pushes only on a real change. So it can be fired liberally
+   from the end of any interaction, and a whole drag collapses into one step.
+   ====================================================================== */
+const HISTORY_MAX = 100;
+const hist = {stack:[], i:-1};
+
+// The grid size and the viewport are display settings, so they stay out of it.
+function modelJSON(){
+  return JSON.stringify({
+    room:{name:state.room.name, pts:state.room.pts,
+          locked:state.room.locked, lockedSize:state.room.lockedSize},
+    objects:state.objects
+  });
+}
+
+function commit(){
+  const m = modelJSON();
+  if (hist.i>=0 && hist.stack[hist.i].m === m) return false;   // nothing changed
+  hist.stack.length = hist.i+1;                                   // drop any redo branch
+  hist.stack.push({m, sel:state.sel ? JSON.parse(JSON.stringify(state.sel)) : null});
+  if (hist.stack.length > HISTORY_MAX) hist.stack.shift();
+  hist.i = hist.stack.length-1;
+  updHistoryUI();
+  return true;
+}
+
+/* A selection captured before an edit may not exist any more. */
+function validSel(sel){
+  if (!sel) return null;
+  if (sel.kind==='object') return state.objects.some(o=>o.id===sel.id) ? sel : null;
+  if (sel.kind==='vertex' || sel.kind==='edge') return sel.i < state.room.pts.length ? sel : null;
+  return sel;
+}
+
+function restore(entry){
+  const d = JSON.parse(entry.m);
+  state.room = {name:d.room.name,
+                pts:d.room.pts.map(p=>({x:p.x, y:p.y, fix:!!p.fix})),
+                locked:d.room.locked, lockedSize:d.room.lockedSize};
+  state.objects = d.objects.map(o=>Object.assign({}, o));
+  state.sel = validSel(entry.sel);
+  if (renaming) endRename();
+  drag = null;
+  refreshList(); updStats(); syncPanel(); draw(); updHistoryUI();
+}
+
+function undo(){
+  if (hist.i<=0){ showHint('Nothing left to undo.'); return; }
+  hist.i--; restore(hist.stack[hist.i]); showHint('Undo');
+}
+function redo(){
+  if (hist.i>=hist.stack.length-1){ showHint('Nothing to redo.'); return; }
+  hist.i++; restore(hist.stack[hist.i]); showHint('Redo');
+}
+function updHistoryUI(){
+  document.getElementById('btnUndo').disabled = hist.i<=0;
+  document.getElementById('btnRedo').disabled = hist.i>=hist.stack.length-1;
+}
+document.getElementById('btnUndo').addEventListener('click',undo);
+document.getElementById('btnRedo').addEventListener('click',redo);
+
+/* Catch-all: these all bubble to window *after* the app's own handlers have
+   run, so the model is already in its post-edit state. Keystrokes are handled
+   at their specific sites instead, so typing a name is one step, not one per
+   letter. */
+['pointerup','click','change'].forEach(t=>window.addEventListener(t,()=>commit()));
+
 /* ---------------- inline rename ---------------- */
 const renameBox = document.getElementById('renameBox');
 let renaming = null;              // {id, prev} while the editor is open
@@ -1105,11 +1191,13 @@ function applyRename(){
     r.o.name = renameBox.value.trim() || r.prev || 'Object';
     refreshList(); syncPanel(); draw();
   }
+  commit();                       // one undo step per rename, not per keystroke
 }
 
 function cancelRename(){
   const r = endRename();
   if (r && r.o){ r.o.name = r.prev; refreshList(); syncPanel(); draw(); }
+  commit();
 }
 
 // keep the canvas in sync as you type
@@ -1136,7 +1224,7 @@ function finishRoom(){
   setTool('select');
   select({kind:'room'});
   hideHint();
-  updStats(); refreshList(); syncPanel(); fit();
+  updStats(); refreshList(); syncPanel(); fit(); commit();
   showHint('Room created — walls are kept square. Drag corners to reshape, or double-click a wall to add a jog.', 3600);
 }
 
@@ -1287,7 +1375,7 @@ function syncPanel(){
           : `Wall #${s.i+1} can't change: wall${blockers.length>1?'s':''} #${blockers.join(', #')} ${blockers.length>1?'are':'is'} pinned. Unpin one to make room.`);
         return;
       }
-      updStats(); draw();
+      updStats(); draw(); commit();
     };
     if(el){ el.addEventListener('change',upd);
             el.addEventListener('keydown',ev=>{ if(ev.key==='Enter') upd(); }); }
@@ -1394,7 +1482,7 @@ function delObject(id){
   if(o.locked){showHint('Object is locked — unlock it before deleting.');return;}
   state.objects=state.objects.filter(x=>x.id!==id);
   if(state.sel&&state.sel.kind==='object'&&state.sel.id===id) state.sel=null;
-  refreshList(); syncPanel(); draw();
+  refreshList(); syncPanel(); draw(); commit();
 }
 
 function updStats(){
@@ -1458,6 +1546,10 @@ window.addEventListener('keydown',e=>{
   shiftDown = e.shiftKey;              // read by the rotation slider, so track it even while typing
   const typing=/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
   if(e.code==='Space'&&!typing){spaceDown=true;if(!drag)cv.style.cursor='grab';e.preventDefault();}
+  if((e.metaKey||e.ctrlKey)&&(e.key==='z'||e.key==='Z')&&!typing){
+    e.preventDefault(); e.shiftKey?redo():undo(); return;
+  }
+  if((e.metaKey||e.ctrlKey)&&(e.key==='y'||e.key==='Y')&&!typing){ e.preventDefault(); redo(); return; }
   if(typing)return;
   if(e.key==='Enter'&&tool==='room'&&drawPts&&drawPts.length>=3){finishRoom();return;}
   if(e.key==='Escape'){
@@ -1532,7 +1624,7 @@ document.getElementById('fileIn').addEventListener('change',e=>{
                                                           {id:uid(), rot:normRot(o.rot)}));
       if(d.gridCm){state.gridCm=d.gridCm;document.getElementById('gridSize').value=d.gridCm;}
       state.sel=null; drawPts=null;
-      refreshList(); updStats(); syncPanel(); fit();
+      refreshList(); updStats(); syncPanel(); fit(); commit();
       showHint(squaredOnLoad
         ? 'Loaded — some walls were not square, so the outline was straightened to '+state.room.pts.length+' corners.'
         : 'Loaded room with '+state.room.pts.length+' corners and '+state.objects.length+' object(s).', squaredOnLoad?5200:0);
@@ -1590,6 +1682,7 @@ window.RoomPlan={
   state, view, select, setTool, draw, fit, objById, delObject, finishRoom,
   polyArea, polyPerimeter, startRename, PX_PER_CM,
   toWorld, toLocal, objCorners, resizeCursor, normRot,
+  undo, redo, commit, hist,
   wallAxis, wallLen, wallDir, absorberFor, setWallLength, blockingWalls,
   rectify, dedupe, moveCorner, addJog, removeCorner, axisSnap, isPinned,
   get tool(){return tool;},
@@ -1605,6 +1698,7 @@ updZoom();
 refreshList();
 updStats();
 syncPanel();
+commit();                          // baseline: the starting plan
 showHint('Walls are horizontal or vertical. Select a wall to set its length, and pin the ones you want kept.',4600);
 })();
 </script>
