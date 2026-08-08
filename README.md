@@ -9,6 +9,7 @@ A small collection of self-contained browser tools, hosted on GitHub Pages.
 | Landing page | [`/`](https://berigor.github.io/hpage/) | `index.html` |
 | Floor Planner | [`/floor-planner/`](https://berigor.github.io/hpage/floor-planner/) | `floor-planner/index.html` |
 | Wheel of Fortune | [`/wheel-of-fortune/`](https://berigor.github.io/hpage/wheel-of-fortune/) | `wheel-of-fortune/index.html` |
+| Three Doors | [`/three-doors/`](https://berigor.github.io/hpage/three-doors/) | `three-doors/index.html` |
 
 ## Adding a page
 
